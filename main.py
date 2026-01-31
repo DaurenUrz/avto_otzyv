@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import re
+import random
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -18,29 +19,18 @@ dp = Dispatcher()
 def init_db():
     conn = sqlite3.connect('driver_rating.db')
     cursor = conn.cursor()
-    # Таблица отзывов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plate TEXT,
-            rating INTEGER,
-            comment TEXT,
-            photo_id TEXT,
-            user_id INTEGER
-        )
-    ''')
-    # Таблица подписок на уведомления
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id INTEGER,
-            plate TEXT,
-            PRIMARY KEY (user_id, plate)
-        )
-    ''')
-    try:
-        cursor.execute("ALTER TABLE reviews ADD COLUMN photo_id TEXT")
-    except sqlite3.OperationalError:
-        pass
+    cursor.execute('''CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, plate TEXT, rating INTEGER, 
+        comment TEXT, photo_id TEXT, video_id TEXT, user_id INTEGER)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id INTEGER, plate TEXT, PRIMARY KEY (user_id, plate))''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS purchases (
+        user_id INTEGER PRIMARY KEY, access_granted INTEGER DEFAULT 0)''')
+    # Миграция колонок
+    try: cursor.execute("ALTER TABLE reviews ADD COLUMN photo_id TEXT")
+    except: pass
+    try: cursor.execute("ALTER TABLE reviews ADD COLUMN video_id TEXT")
+    except: pass
     conn.commit()
     conn.close()
 
@@ -49,12 +39,22 @@ class Form(StatesGroup):
     entering_plate_review = State()
     choosing_rating = State()
     writing_comment = State()
-    sending_photo = State()
+    sending_media = State()
     register_my_plate = State()
+    payment_proof = State()
 
 def clean_plate(plate):
     return re.sub(r'[^A-Z0-9]', '', plate.upper())
 
+def has_access(user_id):
+    conn = sqlite3.connect('driver_rating.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT access_granted FROM purchases WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res and res[0] == 1
+
+# --- ОБРАБОТЧИКИ МЕНЮ ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
     kb = [
@@ -62,64 +62,72 @@ async def start(message: types.Message):
         [KeyboardButton(text="🔔 Отслеживать мой номер")]
     ]
     keyboard = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("🇰🇿 <b>Driver Rating KZ</b>\nУзнайте, что пишут о водителях, или подпишитесь на уведомления о своем авто.", reply_markup=keyboard, parse_mode="HTML")
+    await message.answer("🇰🇿 <b>Driver Rating KZ</b>\nУзнайте правду о водителях или подпишитесь на уведомления о своем авто.", reply_markup=keyboard, parse_mode="HTML")
 
-# --- ПОДПИСКА НА СВОЙ НОМЕР ---
+# --- ОТСЛЕЖИВАНИЕ НОМЕРА ---
 @dp.message(F.text == "🔔 Отслеживать мой номер")
-async def ask_my_plate(message: types.Message, state: FSMContext):
-    await message.answer("Введите госномер вашего авто (напр. 777AAA01).\nМы пришлем уведомление, если кто-то оставит на вас отзыв!")
+async def sub_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите госномер вашего авто (напр. 010ABC01). Пришлем уведомление, если на вас напишут отзыв!")
     await state.set_state(Form.register_my_plate)
 
 @dp.message(Form.register_my_plate)
-async def register_plate(message: types.Message, state: FSMContext):
+async def sub_finish(message: types.Message, state: FSMContext):
     plate = clean_plate(message.text)
     conn = sqlite3.connect('driver_rating.db')
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT INTO subscriptions (user_id, plate) VALUES (?, ?)", (message.from_user.id, plate))
         conn.commit()
-        await message.answer(f"✅ Готово! Теперь вы подписаны на уведомления для номера <b>{plate}</b>.", parse_mode="HTML")
-    except sqlite3.IntegrityError:
-        await message.answer(f"ℹ️ Вы уже подписаны на номер {plate}.")
-    finally:
-        conn.close()
+        await message.answer(f"✅ Готово! Вы подписаны на уведомления для <b>{plate}</b>.", parse_mode="HTML")
+    except:
+        await message.answer(f"Вы уже подписаны на {plate}.")
+    finally: conn.close()
     await state.clear()
 
 # --- ПОИСК ---
 @dp.message(F.text == "🔍 Проверить номер")
-async def ask_plate_search(message: types.Message, state: FSMContext):
-    await message.answer("Введите госномер авто:")
+async def search_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите госномер для проверки:")
     await state.set_state(Form.entering_plate_search)
 
 @dp.message(Form.entering_plate_search)
-async def search_plate(message: types.Message, state: FSMContext):
+async def search_finish(message: types.Message, state: FSMContext):
     plate = clean_plate(message.text)
+    user_access = has_access(message.from_user.id)
+    
     conn = sqlite3.connect('driver_rating.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT rating, comment, photo_id FROM reviews WHERE plate = ?", (plate,))
+    cursor.execute("SELECT rating, comment, photo_id, video_id FROM reviews WHERE plate = ?", (plate,))
     results = cursor.fetchall()
     conn.close()
 
     if not results:
-        await message.answer(f"По номеру <b>{plate}</b> отзывов пока нет.", parse_mode="HTML")
+        await message.answer(f"По номеру {plate} отзывов нет.")
     else:
         await message.answer(f"📊 Найдено отзывов: {len(results)}")
-        for res in results:
+        for i, res in enumerate(results):
+            # Если это не первый отзыв и у юзера нет доступа - скрываем
+            if i > 0 and not user_access:
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔓 Открыть все отзывы (500 ₸)", callback_data="buy_full")]])
+                await message.answer(f"🔒 Еще {len(results)-1} отзыва скрыто. Оплатите доступ, чтобы увидеть всё.", reply_markup=kb)
+                break
+            
             stars = "⭐" * res[0]
-            if res[2]:
-                await message.answer_photo(res[2], caption=f"{stars}\n{res[1]}", parse_mode="HTML")
-            else:
-                await message.answer(f"{stars}\n{res[1]}", parse_mode="HTML")
+            cap = f"{stars}\n{res[1]}"
+            if res[3]: await message.answer_video(res[3], caption=cap)
+            elif res[2]: await message.answer_photo(res[2], caption=cap)
+            else: await message.answer(cap)
+            
     await state.clear()
 
-# --- ДОБАВЛЕНИЕ ОТЗЫВА И УВЕДОМЛЕНИЕ ---
+# --- ДОБАВЛЕНИЕ ОТЗЫВА ---
 @dp.message(F.text == "✍️ Оставить отзыв")
-async def ask_plate_review(message: types.Message, state: FSMContext):
-    await message.answer("Введите госномер автомобиля:")
+async def review_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите номер автомобиля:")
     await state.set_state(Form.entering_plate_review)
 
 @dp.message(Form.entering_plate_review)
-async def process_plate_review(message: types.Message, state: FSMContext):
+async def review_plate(message: types.Message, state: FSMContext):
     plate = clean_plate(message.text)
     await state.update_data(plate=plate)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{i}⭐", callback_data=f"rate_{i}") for i in range(1, 6)]])
@@ -127,50 +135,70 @@ async def process_plate_review(message: types.Message, state: FSMContext):
     await state.set_state(Form.choosing_rating)
 
 @dp.callback_query(F.data.startswith("rate_"))
-async def process_rating(callback: types.CallbackQuery, state: FSMContext):
+async def review_rate(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(rating=int(callback.data.split("_")[1]))
-    await callback.message.answer("Напишите текст отзыва:")
+    await callback.message.answer("Что произошло?")
     await state.set_state(Form.writing_comment)
     await callback.answer()
 
 @dp.message(Form.writing_comment)
-async def process_comment(message: types.Message, state: FSMContext):
+async def review_comment(message: types.Message, state: FSMContext):
     await state.update_data(comment=message.text)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить фото")]], resize_keyboard=True)
-    await message.answer("Добавьте фото или пропустите:", reply_markup=kb)
-    await state.set_state(Form.sending_photo)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить медиа")]], resize_keyboard=True)
+    await message.answer("Добавьте фото/видео или пропустите:", reply_markup=kb)
+    await state.set_state(Form.sending_media)
 
-@dp.message(Form.sending_photo)
-async def process_photo(message: types.Message, state: FSMContext):
+@dp.message(Form.sending_media)
+async def review_media(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    photo_id = message.photo[-1].file_id if message.photo else None
+    p_id = message.photo[-1].file_id if message.photo else None
+    v_id = message.video.file_id if message.video else None
     plate = data['plate']
     
     conn = sqlite3.connect('driver_rating.db')
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO reviews (plate, rating, comment, photo_id, user_id) VALUES (?, ?, ?, ?, ?)", 
-                   (plate, data['rating'], data['comment'], photo_id, message.from_user.id))
+    cursor.execute("INSERT INTO reviews (plate, rating, comment, photo_id, video_id, user_id) VALUES (?, ?, ?, ?, ?, ?)", 
+                   (plate, data['rating'], data['comment'], p_id, v_id, message.from_user.id))
     
-    # Ищем подписчиков на этот номер
+    # Уведомление подписчикам
     cursor.execute("SELECT user_id FROM subscriptions WHERE plate = ?", (plate,))
-    subscribers = cursor.fetchall()
-    conn.commit()
-    conn.close()
+    subs = cursor.fetchall()
+    conn.commit(); conn.close()
 
-    # Рассылка уведомлений владельцам
-    alert_text = f"❗ <b>Новый отзыв на ваш номер {plate}!</b>\n\n⭐ Оценка: {data['rating']}/5\n💬 Отзыв: {data['comment']}"
-    for sub in subscribers:
-        try:
-            if photo_id:
-                await bot.send_photo(sub[0], photo_id, caption=alert_text, parse_mode="HTML")
-            else:
-                await bot.send_message(sub[0], alert_text, parse_mode="HTML")
-        except:
-            pass # Если пользователь заблокировал бота
+    for s in subs:
+        try: await bot.send_message(s[0], f"❗ <b>Новый отзыв на ваш авто {plate}!</b>\n\nПроверьте в поиске.")
+        except: pass
 
-    await message.answer("✅ Отзыв опубликован. Владелец (если он в базе) получит уведомление!", 
-                         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер")], [KeyboardButton(text="✍️ Оставить отзыв")]], resize_keyboard=True))
+    await message.answer("✅ Отзыв опубликован!", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер")]], resize_keyboard=True))
     await state.clear()
+
+# --- СИСТЕМА ОПЛАТЫ ---
+@dp.callback_query(F.data == "buy_full")
+async def pay_start(callback: types.CallbackQuery, state: FSMContext):
+    order_id = random.randint(100, 999)
+    await message.answer(f"💳 <b>Оплата доступа</b>\nПереведите <b>500 ₸</b> на Kaspi: <code>+77000000000</code>\nКомментарий: <code>ID{order_id}</code>\n\n<b>Пришлите скриншот чека сюда:</b>", parse_mode="HTML")
+    await state.set_state(Form.payment_proof)
+    await callback.answer()
+
+@dp.message(Form.payment_proof, F.photo)
+async def pay_proof(message: types.Message, state: FSMContext):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"confirm_{message.from_user.id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{message.from_user.id}")]
+    ])
+    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"💰 Чек от {message.from_user.id}", reply_markup=kb)
+    await message.answer("⏳ Чек отправлен модератору. Ожидайте подтверждения.")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("confirm_"))
+async def pay_confirm(callback: types.CallbackQuery):
+    uid = int(callback.data.split("_")[1])
+    conn = sqlite3.connect('driver_rating.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO purchases (user_id, access_granted) VALUES (?, 1)", (uid,))
+    conn.commit(); conn.close()
+    await bot.send_message(uid, "💎 <b>Доступ открыт!</b> Теперь вам видны все отзывы.")
+    await callback.message.edit_caption(caption="✅ ОДОБРЕНО")
 
 async def main():
     init_db()
