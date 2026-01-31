@@ -26,7 +26,6 @@ def init_db():
         user_id INTEGER, plate TEXT, PRIMARY KEY (user_id, plate))''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS purchases (
         user_id INTEGER PRIMARY KEY, access_granted INTEGER DEFAULT 0)''')
-    # Миграция колонок
     try: cursor.execute("ALTER TABLE reviews ADD COLUMN photo_id TEXT")
     except: pass
     try: cursor.execute("ALTER TABLE reviews ADD COLUMN video_id TEXT")
@@ -67,7 +66,7 @@ async def start(message: types.Message):
 # --- ОТСЛЕЖИВАНИЕ НОМЕРА ---
 @dp.message(F.text == "🔔 Отслеживать мой номер")
 async def sub_start(message: types.Message, state: FSMContext):
-    await message.answer("Введите госномер вашего авто (напр. 010ABC01). Пришлем уведомление, если на вас напишут отзыв!")
+    await message.answer("Введите госномер вашего авто (напр. 010ABC01):")
     await state.set_state(Form.register_my_plate)
 
 @dp.message(Form.register_my_plate)
@@ -106,7 +105,6 @@ async def search_finish(message: types.Message, state: FSMContext):
     else:
         await message.answer(f"📊 Найдено отзывов: {len(results)}")
         for i, res in enumerate(results):
-            # Если это не первый отзыв и у юзера нет доступа - скрываем
             if i > 0 and not user_access:
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔓 Открыть все отзывы (500 ₸)", callback_data="buy_full")]])
                 await message.answer(f"🔒 Еще {len(results)-1} отзыва скрыто. Оплатите доступ, чтобы увидеть всё.", reply_markup=kb)
@@ -117,7 +115,6 @@ async def search_finish(message: types.Message, state: FSMContext):
             if res[3]: await message.answer_video(res[3], caption=cap)
             elif res[2]: await message.answer_photo(res[2], caption=cap)
             else: await message.answer(cap)
-            
     await state.clear()
 
 # --- ДОБАВЛЕНИЕ ОТЗЫВА ---
@@ -160,23 +157,23 @@ async def review_media(message: types.Message, state: FSMContext):
     cursor.execute("INSERT INTO reviews (plate, rating, comment, photo_id, video_id, user_id) VALUES (?, ?, ?, ?, ?, ?)", 
                    (plate, data['rating'], data['comment'], p_id, v_id, message.from_user.id))
     
-    # Уведомление подписчикам
     cursor.execute("SELECT user_id FROM subscriptions WHERE plate = ?", (plate,))
     subs = cursor.fetchall()
     conn.commit(); conn.close()
 
     for s in subs:
-        try: await bot.send_message(s[0], f"❗ <b>Новый отзыв на ваш авто {plate}!</b>\n\nПроверьте в поиске.")
+        try: await bot.send_message(s[0], f"❗ <b>Новый отзыв на ваш авто {plate}!</b>\nПроверьте в поиске.")
         except: pass
 
-    await message.answer("✅ Отзыв опубликован!", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер")]], resize_keyboard=True))
+    await message.answer("✅ Отзыв опубликован!", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер"), KeyboardButton(text="✍️ Оставить отзыв")]], resize_keyboard=True))
     await state.clear()
 
-# --- СИСТЕМА ОПЛАТЫ ---
+# --- СИСТЕМА ОПЛАТЫ (ИСПРАВЛЕНА) ---
 @dp.callback_query(F.data == "buy_full")
 async def pay_start(callback: types.CallbackQuery, state: FSMContext):
     order_id = random.randint(100, 999)
-    await message.answer(f"💳 <b>Оплата доступа</b>\nПереведите <b>500 ₸</b> на Kaspi: <code>+77000000000</code>\nКомментарий: <code>ID{order_id}</code>\n\n<b>Пришлите скриншот чека сюда:</b>", parse_mode="HTML")
+    # ИСПРАВЛЕНО: используем callback.message вместо message
+    await callback.message.answer(f"💳 <b>Оплата доступа</b>\nПереведите <b>500 ₸</b> на Kaspi: <code>+77770000000</code>\nКомментарий: <code>ID{order_id}</code>\n\n<b>Пришлите скриншот чека сюда:</b>", parse_mode="HTML")
     await state.set_state(Form.payment_proof)
     await callback.answer()
 
@@ -186,7 +183,7 @@ async def pay_proof(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"confirm_{message.from_user.id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{message.from_user.id}")]
     ])
-    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"💰 Чек от {message.from_user.id}", reply_markup=kb)
+    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"💰 Чек от {message.from_user.full_name} ({message.from_user.id})", reply_markup=kb)
     await message.answer("⏳ Чек отправлен модератору. Ожидайте подтверждения.")
     await state.clear()
 
@@ -197,8 +194,11 @@ async def pay_confirm(callback: types.CallbackQuery):
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO purchases (user_id, access_granted) VALUES (?, 1)", (uid,))
     conn.commit(); conn.close()
-    await bot.send_message(uid, "💎 <b>Доступ открыт!</b> Теперь вам видны все отзывы.")
-    await callback.message.edit_caption(caption="✅ ОДОБРЕНО")
+    try:
+        await bot.send_message(uid, "💎 <b>Доступ открыт!</b> Теперь вам видны все отзывы.")
+    except: pass
+    await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n✅ ОДОБРЕНО")
+    await callback.answer()
 
 async def main():
     init_db()
