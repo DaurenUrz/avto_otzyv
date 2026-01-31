@@ -40,18 +40,25 @@ class Form(StatesGroup):
 class AdminState(StatesGroup):
     waiting_broadcast_text = State()
     waiting_delete_plate = State()
+    waiting_user_search = State()
 
 # --- ИНИЦИАЛИЗАЦИЯ БД ---
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
+    # Таблица отзывов
     await conn.execute('''CREATE TABLE IF NOT EXISTS reviews (
         id SERIAL PRIMARY KEY, plate TEXT, rating INTEGER, 
         comment TEXT, photo_id TEXT, video_id TEXT, 
         latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, user_id BIGINT)''')
+    # Таблица подписок
     await conn.execute('''CREATE TABLE IF NOT EXISTS subscriptions (
         user_id BIGINT, plate TEXT, PRIMARY KEY (user_id, plate))''')
+    # Таблица покупок
     await conn.execute('''CREATE TABLE IF NOT EXISTS purchases (
         user_id BIGINT PRIMARY KEY, access_granted INTEGER DEFAULT 0, multi_car INTEGER DEFAULT 0)''')
+    # Таблица пользователей (ДЛЯ ТЕГОВ)
+    await conn.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY, username TEXT, full_name TEXT, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     await conn.close()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -74,48 +81,77 @@ async def set_main_menu(bot: Bot):
         BotCommand(command="search", description="Проверить номер"),
         BotCommand(command="review", description="Оставить отзыв"),
         BotCommand(command="my_cars", description="Мой гараж 🚗"),
-        BotCommand(command="admin", description="Админка (только для владельца)")
+        BotCommand(command="admin", description="Админка")
     ]
     await bot.set_my_commands(commands)
 
 # --- ОБРАБОТЧИКИ МЕНЮ ---
 @dp.message(Command("start"))
 async def start(message: types.Message):
+    # СОХРАНЯЕМ ДАННЫЕ ПОЛЬЗОВАТЕЛЯ (ТЕГ И ИМЯ)
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute('''INSERT INTO users (user_id, username, full_name) 
+                          VALUES ($1, $2, $3) 
+                          ON CONFLICT (user_id) DO UPDATE SET username = $2, full_name = $3''', 
+                       message.from_user.id, message.from_user.username, message.from_user.full_name)
+    await conn.close()
+
     kb = [[KeyboardButton(text="🔍 Проверить номер"), KeyboardButton(text="✍️ Оставить отзыв")],
           [KeyboardButton(text="🚗 Мои авто"), KeyboardButton(text="🔔 Подписаться")]]
     keyboard = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("🇰🇿 <b>Driver Rating KZ Pro (Postgres)</b>\nСистема контроля кармы водителей запущена.", reply_markup=keyboard, parse_mode="HTML")
+    await message.answer(f"🇰🇿 <b>Driver Rating KZ Pro</b>\nСалам, {message.from_user.first_name}! База данных активна.", reply_markup=keyboard, parse_mode="HTML")
 
-# --- АДМИН-ПАНЕЛЬ ---
+# --- АДМИН-ПАНЕЛЬ (НОВАЯ ВЕРСИЯ) ---
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def admin_panel(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика БД", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), InlineKeyboardButton(text="🔍 Найти юзера", callback_data="admin_find_user")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="🗑 Удалить номер", callback_data="admin_del_plate")]
     ])
-    await message.answer("🛠 <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
+    await message.answer("🛠 <b>Панель управления</b>", reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_stats", F.from_user.id == ADMIN_ID)
 async def admin_stats_handler(callback: types.CallbackQuery):
     conn = await asyncpg.connect(DATABASE_URL)
+    u_count = await conn.fetchval("SELECT COUNT(*) FROM users")
     revs = await conn.fetchval("SELECT COUNT(*) FROM reviews")
-    subs = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
     sales = await conn.fetchval("SELECT COUNT(*) FROM purchases WHERE access_granted = 1 OR multi_car = 1")
     await conn.close()
-    await callback.message.answer(f"📊 <b>Статистика:</b>\n\n📝 Отзывов: {revs}\n🚗 В гаражах: {subs}\n💰 Оплат: {sales}", parse_mode="HTML")
+    await callback.message.answer(f"📊 <b>Цифры:</b>\n\n👥 Юзеров в базе: {u_count}\n📝 Отзывов: {revs}\n💰 Оплат: {sales}", parse_mode="HTML")
     await callback.answer()
 
-@dp.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
-async def admin_broadcast_init(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите текст рассылки для всех пользователей:")
-    await state.set_state(AdminState.waiting_broadcast_text)
+@dp.callback_query(F.data == "admin_find_user", F.from_user.id == ADMIN_ID)
+async def admin_find_user_init(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите @username или ID пользователя:")
+    await state.set_state(AdminState.waiting_user_search)
     await callback.answer()
+
+@dp.message(AdminState.waiting_user_search)
+async def perform_user_search(message: types.Message, state: FSMContext):
+    search_query = message.text.replace("@", "").strip()
+    conn = await asyncpg.connect(DATABASE_URL)
+    if search_query.isdigit():
+        user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", int(search_query))
+    else:
+        user = await conn.fetchrow("SELECT * FROM users WHERE username ILIKE $1", search_query)
+    await conn.close()
+
+    if user:
+        text = (f"👤 <b>Найден пользователь:</b>\n\n"
+                f"ID: <code>{user['user_id']}</code>\n"
+                f"Тег: @{user['username'] if user['username'] else 'нет'}\n"
+                f"Имя: {user['full_name']}\n"
+                f"Дата входа: {user['joined_at'].strftime('%d.%m.%Y')}")
+        await message.answer(text, parse_mode="HTML")
+    else:
+        await message.answer("❌ Пользователь не найден в базе.")
+    await state.clear()
 
 @dp.message(AdminState.waiting_broadcast_text)
 async def perform_broadcast(message: types.Message, state: FSMContext):
     conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch("SELECT DISTINCT user_id FROM reviews UNION SELECT DISTINCT user_id FROM subscriptions")
+    rows = await conn.fetch("SELECT user_id FROM users")
     await conn.close()
     success = 0
     for row in rows:
@@ -124,12 +160,37 @@ async def perform_broadcast(message: types.Message, state: FSMContext):
             success += 1
             await asyncio.sleep(0.05)
         except: pass
-    await message.answer(f"✅ Рассылка завершена!\nДоставлено: {success}")
+    await message.answer(f"✅ Рассылка завершена!\nПолучили: {success} чел.")
     await state.clear()
+
+# --- ПЛАТЕЖИ С ТЕГАМИ В АДМИНКЕ ---
+@dp.message(Form.payment_proof, F.photo)
+async def pay_check(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pt = data.get('ptype', 'full')
+    user_tag = f"@{message.from_user.username}" if message.from_user.username else "нет тега"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"conf_{message.from_user.id}_{pt}")]])
+    
+    caption = (f"💳 <b>Новый чек!</b>\n\n"
+               f"Тип: {pt.upper()}\n"
+               f"От: {message.from_user.full_name} ({user_tag})\n"
+               f"ID: <code>{message.from_user.id}</code>")
+    
+    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+    await message.answer("⏳ Чек принят. Ожидайте подтверждения.")
+    await state.clear()
+
+# --- ВСЯ ОСТАЛЬНАЯ ЛОГИКА (БЕЗ ИЗМЕНЕНИЙ) ---
+@dp.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
+async def admin_broadcast_init(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите текст рассылки:")
+    await state.set_state(AdminState.waiting_broadcast_text)
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_del_plate", F.from_user.id == ADMIN_ID)
 async def admin_del_init(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите госномер для ПОЛНОГО удаления:")
+    await callback.message.answer("Введите номер для удаления:")
     await state.set_state(AdminState.waiting_delete_plate)
     await callback.answer()
 
@@ -139,44 +200,7 @@ async def perform_delete(message: types.Message, state: FSMContext):
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute("DELETE FROM reviews WHERE plate = $1", plate)
     await conn.close()
-    await message.answer(f"🗑 Все данные по {plate} удалены.")
-    await state.clear()
-
-# --- ГАРАЖ И ПОИСК ---
-@dp.message(F.text == "🚗 Мои авто")
-@dp.message(Command("my_cars"))
-async def my_cars(message: types.Message):
-    conn = await asyncpg.connect(DATABASE_URL)
-    cars = await conn.fetch("SELECT plate FROM subscriptions WHERE user_id = $1", message.from_user.id)
-    await conn.close()
-    if not cars:
-        await message.answer("Ваш гараж пуст.")
-    else:
-        text = "🚘 <b>Ваши авто:</b>\n\n" + "\n".join([f"• <code>{c['plate']}</code>" for c in cars])
-        await message.answer(text, parse_mode="HTML")
-
-@dp.message(F.text == "🔔 Подписаться")
-async def sub_check(message: types.Message, state: FSMContext):
-    conn = await asyncpg.connect(DATABASE_URL)
-    count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE user_id = $1", message.from_user.id)
-    await conn.close()
-    _, multi = await get_user_status(message.from_user.id)
-    if count >= 1 and multi == 0:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Multi-Car (1000 ₸)", callback_data="buy_multi")]])
-        await message.answer("⚠️ Лимит: 1 авто. Купите Multi-Car доступ.", reply_markup=kb)
-    else:
-        await message.answer("Введите госномер:")
-        await state.set_state(Form.register_my_plate)
-
-@dp.message(Form.register_my_plate)
-async def sub_finish(message: types.Message, state: FSMContext):
-    plate = clean_plate(message.text)
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        await conn.execute("INSERT INTO subscriptions (user_id, plate) VALUES ($1, $2)", message.from_user.id, plate)
-        await message.answer(f"✅ Вы подписаны на {plate}.")
-    except: await message.answer("Ошибка или номер уже в гараже.")
-    finally: await conn.close()
+    await message.answer(f"🗑 {plate} очищен.")
     await state.clear()
 
 @dp.message(F.text == "🔍 Проверить номер")
@@ -214,7 +238,6 @@ async def search_finish(message: types.Message, state: FSMContext):
             else: await message.answer(cap, reply_markup=kb_m, parse_mode="HTML")
     await state.clear()
 
-# --- ПЛАТЕЖИ ---
 @dp.callback_query(F.data.startswith("buy_"))
 async def pay_init(callback: types.CallbackQuery, state: FSMContext):
     ptype = callback.data.split("_")[1]
@@ -223,15 +246,6 @@ async def pay_init(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(f"💳 Оплата {ptype.upper()} ({price})\nKaspi: <code>+77770000000</code>\nПришлите фото чека:")
     await state.set_state(Form.payment_proof)
     await callback.answer()
-
-@dp.message(Form.payment_proof, F.photo)
-async def pay_check(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    pt = data.get('ptype', 'full')
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"conf_{message.from_user.id}_{pt}")]])
-    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"Чек {pt} от {message.from_user.id}", reply_markup=kb)
-    await message.answer("⏳ Чек на проверке модератором.")
-    await state.clear()
 
 @dp.callback_query(F.data.startswith("conf_"))
 async def pay_confirm(callback: types.CallbackQuery):
@@ -252,7 +266,6 @@ async def pay_confirm(callback: types.CallbackQuery):
     await bot.send_message(uid, msg, parse_mode="HTML")
     await callback.message.edit_caption(caption="✅ ПОДТВЕРЖДЕНО")
 
-# --- ОТЗЫВЫ ---
 @dp.message(F.text == "✍️ Оставить отзыв")
 async def review_start(message: types.Message, state: FSMContext):
     await message.answer("Введите госномер:")
@@ -299,6 +312,37 @@ async def review_final(message: types.Message, state: FSMContext):
         try: await bot.send_message(s['user_id'], f"❗ Новый отзыв на ваш авто {data['plate']}!")
         except: pass
     await message.answer("✅ Опубликовано!", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер")]], resize_keyboard=True))
+    await state.clear()
+
+@dp.message(F.text == "🚗 Мои авто")
+async def my_cars(message: types.Message):
+    conn = await asyncpg.connect(DATABASE_URL)
+    cars = await conn.fetch("SELECT plate FROM subscriptions WHERE user_id = $1", message.from_user.id)
+    await conn.close()
+    if not cars: await message.answer("Гараж пуст.")
+    else: await message.answer("🚘 <b>Ваши авто:</b>\n\n" + "\n".join([f"• <code>{c['plate']}</code>" for c in cars]), parse_mode="HTML")
+
+@dp.message(F.text == "🔔 Подписаться")
+async def sub_check(message: types.Message, state: FSMContext):
+    conn = await asyncpg.connect(DATABASE_URL)
+    count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE user_id = $1", message.from_user.id)
+    await conn.close()
+    _, multi = await get_user_status(message.from_user.id)
+    if count >= 1 and multi == 0:
+        await message.answer("⚠️ Лимит: 1 авто. Купите Multi-Car.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Купить", callback_data="buy_multi")]]))
+    else:
+        await message.answer("Введите госномер:")
+        await state.set_state(Form.register_my_plate)
+
+@dp.message(Form.register_my_plate)
+async def sub_finish(message: types.Message, state: FSMContext):
+    plate = clean_plate(message.text)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("INSERT INTO subscriptions (user_id, plate) VALUES ($1, $2)", message.from_user.id, plate)
+        await message.answer(f"✅ Подписаны на {plate}.")
+    except: await message.answer("Уже есть в гараже.")
+    finally: await conn.close()
     await state.clear()
 
 @dp.callback_query(F.data.startswith("share_"))
