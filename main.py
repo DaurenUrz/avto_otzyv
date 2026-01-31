@@ -39,10 +39,10 @@ def init_db():
         user_id INTEGER PRIMARY KEY, access_granted INTEGER DEFAULT 0)''')
     
     # Миграции
-    try: cursor.execute("ALTER TABLE reviews ADD COLUMN latitude REAL")
-    except: pass
-    try: cursor.execute("ALTER TABLE reviews ADD COLUMN longitude REAL")
-    except: pass
+    columns = [('latitude', 'REAL'), ('longitude', 'REAL'), ('photo_id', 'TEXT'), ('video_id', 'TEXT')]
+    for col, c_type in columns:
+        try: cursor.execute(f"ALTER TABLE reviews ADD COLUMN {col} {c_type}")
+        except: pass
     conn.commit()
     conn.close()
 
@@ -79,9 +79,9 @@ async def start(message: types.Message):
         [KeyboardButton(text="🔔 Отслеживать мой номер")]
     ]
     keyboard = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("🇰🇿 <b>Driver Rating KZ</b>\nУзнайте рейтинг водителя и место нарушения на карте.", reply_markup=keyboard, parse_mode="HTML")
+    await message.answer("🇰🇿 <b>Driver Rating KZ v2.5</b>\nБаза отзывов о водителях с поддержкой ГЕО и Threads.", reply_markup=keyboard, parse_mode="HTML")
 
-# --- ПОИСК ---
+# --- ПОИСК И ШЕРИНГ ---
 @dp.message(F.text == "🔍 Проверить номер")
 async def search_start(message: types.Message, state: FSMContext):
     await message.answer("Введите госномер:")
@@ -102,7 +102,6 @@ async def search_finish(message: types.Message, state: FSMContext):
     if not results:
         await message.answer(f"По номеру <b>{plate}</b> ({region}) отзывов нет.", parse_mode="HTML")
     else:
-        # РАСЧЕТ СРЕДНЕГО РЕЙТИНГА
         total = len(results)
         avg_val = sum(res[0] for res in results) / total
         stars_overall = "⭐" * int(round(avg_val))
@@ -111,24 +110,56 @@ async def search_finish(message: types.Message, state: FSMContext):
                   f"📊 Рейтинг: {stars_overall} ({avg_val:.1f}/5)\n"
                   f"💬 Отзывов: {total}\n"
                   f"________________________")
-        await message.answer(header, parse_mode="HTML")
+        
+        # Кнопка для Threads/Stories
+        kb_share = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📲 Поделиться рейтингом", callback_data=f"share_{plate}")]
+        ])
+        
+        await message.answer(header, parse_mode="HTML", reply_markup=kb_share)
 
         for i, res in enumerate(results):
             if i > 0 and not user_access:
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔓 Показать скрытые отзывы (500 ₸)", callback_data="buy_full")]])
-                await message.answer(f"🔒 Скрыто еще {total-1} отзыва.", reply_markup=kb)
+                kb_pay = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔓 Открыть всё (500 ₸)", callback_data="buy_full")]])
+                await message.answer(f"🔒 Скрыто еще {total-1} отзыва.", reply_markup=kb_pay)
                 break
             
             cap = f"Отзыв #{i+1}: {'⭐' * res[0]}\n<i>«{res[1]}»</i>"
-            kb = None
-            if res[4] and res[5]: # Ссылка на карты
+            kb_map = None
+            if res[4] and res[5]:
                 map_url = f"https://www.google.com/maps?q={res[4]},{res[5]}"
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📍 Где это было?", url=map_url)]])
+                kb_map = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📍 На карте", url=map_url)]])
             
-            if res[3]: await message.answer_video(res[3], caption=cap, reply_markup=kb, parse_mode="HTML")
-            elif res[2]: await message.answer_photo(res[2], caption=cap, reply_markup=kb, parse_mode="HTML")
-            else: await message.answer(cap, reply_markup=kb, parse_mode="HTML")
+            if res[3]: await message.answer_video(res[3], caption=cap, reply_markup=kb_map, parse_mode="HTML")
+            elif res[2]: await message.answer_photo(res[2], caption=cap, reply_markup=kb_map, parse_mode="HTML")
+            else: await message.answer(cap, reply_markup=kb_map, parse_mode="HTML")
     await state.clear()
+
+@dp.callback_query(F.data.startswith("share_"))
+async def share_handler(callback: types.CallbackQuery):
+    plate = callback.data.split("_")[1]
+    region = get_region_name(plate)
+    
+    conn = sqlite3.connect('driver_rating.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT rating FROM reviews WHERE plate = ?", (plate,))
+    ratings = cursor.fetchall()
+    conn.close()
+    
+    avg = sum(r[0] for r in ratings) / len(ratings)
+    stars = "⭐" * int(round(avg))
+    me = await bot.get_me()
+    
+    share_box = (
+        f"🚗 <b>DRIVER CARD: {plate}</b>\n"
+        f"🇰🇿 Регион: {region}\n"
+        f"📊 Рейтинг: {stars} ({avg:.1f}/5)\n\n"
+        f"📢 <i>Проверь карму своего авто в боте:</i>\n"
+        f"👉 @{me.username}"
+    )
+    await callback.message.answer("📸 <b>Сделайте скриншот для Threads:</b>")
+    await callback.message.answer(share_box, parse_mode="HTML")
+    await callback.answer()
 
 # --- ДОБАВЛЕНИЕ ОТЗЫВА ---
 @dp.message(F.text == "✍️ Оставить отзыв")
@@ -147,7 +178,7 @@ async def review_plate(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("rate_"))
 async def review_rate(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(rating=int(callback.data.split("_")[1]))
-    await callback.message.answer("Опишите, что случилось:")
+    await callback.message.answer("Опишите ситуацию:")
     await state.set_state(Form.writing_comment)
     await callback.answer()
 
@@ -158,15 +189,15 @@ async def review_comment(message: types.Message, state: FSMContext):
         [KeyboardButton(text="📍 Отправить гео", request_location=True)],
         [KeyboardButton(text="Пропустить")]
     ], resize_keyboard=True)
-    await message.answer("Добавьте геолокацию (кнопка снизу):", reply_markup=kb)
+    await message.answer("Где это было? (кнопка ниже)", reply_markup=kb)
     await state.set_state(Form.sending_geo)
 
 @dp.message(Form.sending_geo)
 async def review_geo(message: types.Message, state: FSMContext):
     if message.location:
         await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить")]], resize_keyboard=True)
-    await message.answer("Пришлите фото/видео или нажмите Пропустить:", reply_markup=kb)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить медиа")]], resize_keyboard=True)
+    await message.answer("Пришлите фото/видео:", reply_markup=kb)
     await state.set_state(Form.sending_media)
 
 @dp.message(Form.sending_media)
@@ -180,7 +211,6 @@ async def review_final(message: types.Message, state: FSMContext):
     cursor.execute("INSERT INTO reviews (plate, rating, comment, photo_id, video_id, latitude, longitude, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
                    (data['plate'], data['rating'], data['comment'], p_id, v_id, data.get('lat'), data.get('lon'), message.from_user.id))
     
-    # Уведомление подписчикам
     cursor.execute("SELECT user_id FROM subscriptions WHERE plate = ?", (data['plate'],))
     subs = cursor.fetchall()
     conn.commit(); conn.close()
@@ -188,14 +218,14 @@ async def review_final(message: types.Message, state: FSMContext):
         try: await bot.send_message(s[0], f"❗ Новый отзыв на ваш авто {data['plate']}!")
         except: pass
 
-    await message.answer("✅ Отзыв опубликован!", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер")]], resize_keyboard=True))
+    await message.answer("✅ Готово!", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Проверить номер")]], resize_keyboard=True))
     await state.clear()
 
-# --- ПЛАТЕЖИ, ПОДПИСКИ И MAIN (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- ПЛАТЕЖИ И ПОДПИСКИ ---
 @dp.callback_query(F.data == "buy_full")
 async def pay_start(callback: types.CallbackQuery, state: FSMContext):
     order_id = random.randint(100, 999)
-    await callback.message.answer(f"💳 <b>Оплата</b>\n500 ₸ на Kaspi: <code>+77770000000</code>\nID: {order_id}\nЖду скрин чека:", parse_mode="HTML")
+    await callback.message.answer(f"💳 500 ₸ на Kaspi: <code>+77770000000</code>\nID: {order_id}\nЖду фото чека:")
     await state.set_state(Form.payment_proof)
     await callback.answer()
 
@@ -203,7 +233,7 @@ async def pay_start(callback: types.CallbackQuery, state: FSMContext):
 async def pay_proof(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"confirm_{message.from_user.id}")]])
     await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"Чек {message.from_user.id}", reply_markup=kb)
-    await message.answer("⏳ Проверяем чек...")
+    await message.answer("⏳ Чек на проверке.")
     await state.clear()
 
 @dp.callback_query(F.data.startswith("confirm_"))
@@ -229,7 +259,7 @@ async def sub_finish(message: types.Message, state: FSMContext):
     try:
         cursor.execute("INSERT INTO subscriptions (user_id, plate) VALUES (?, ?)", (message.from_user.id, plate))
         conn.commit()
-        await message.answer(f"✅ Вы будете получать уведомления о {plate}")
+        await message.answer(f"✅ Подписка на {plate} активна.")
     except: await message.answer("Уже подписаны.")
     finally: conn.close()
     await state.clear()
